@@ -1,0 +1,32 @@
+# Secrets and local configuration
+config.json
+config.json.*
+config.*.json
+!config.example.json
+.env
+.env.*
+!.env.example
+
+# Runtime data
+*.log
+*.log.*
+history.jsonl
+
+# Python cache/build output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local editor/assistant state
+.claude/settings.local.json
+.codex
+.codex/
+
+# Local backups
+*.bak
+*.backup
+*.bakup*
+vps_monitor.py.backup

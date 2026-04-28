@@ -1,0 +1,17 @@
+{
+  "dingtalk": {
+    "webhook": "https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN",
+    "secret": "SEC_YOUR_DINGTALK_SECRET"
+  },
+  "vps_list": [
+    {
+      "veid": "YOUR_VEID",
+      "api_key": "YOUR_BANDWAGON_API_KEY",
+      "name": "example-vps"
+    }
+  ],
+  "monitor": {
+    "alert_threshold": 80,
+    "warning_threshold": 60
+  }
+}
