@@ -211,14 +211,14 @@ class DingTalkRobot:
         
         return self._send_request(data)
 
-    def send_alert_card(self, critical_vps: List[Dict]):
+    def send_alert_card(self, critical_vps: List[Dict], critical_threshold: float = 90):
         """发送独立 ActionCard 告警，确保紧急信息不被长报告淹没"""
         data = {
             'msgtype': 'actionCard',
             'actionCard': {
                 'title': f'🚨 {len(critical_vps)} 台 VPS 流量紧急',
                 'text': f'## 🚨 流量紧急告警\n\n'
-                        f'以下服务器流量使用超过 90%:\n\n' +
+                        f'以下服务器流量使用超过 {critical_threshold}%:\n\n' +
                         '\n'.join([
                             f'- **{v["name"]}**: {v["bandwidth"]["usage_percent"]}% '
                             f'(剩余 {v["bandwidth"]["remaining_gb"]} GB，'
@@ -385,16 +385,14 @@ class VPSMonitor:
         }
     
     @staticmethod
-    def get_status_icon(usage_percent: float) -> str:
-        """根据使用率返回状态图标"""
-        if usage_percent >= 90:
+    def get_status_icon(usage_percent: float, critical_bound: float = 90, alert_bound: float = 80, warning_bound: float = 60) -> str:
+        """根据使用率和配置阈值返回状态图标"""
+        if usage_percent >= critical_bound:
             return '🔴'
-        elif usage_percent >= 80:
+        elif usage_percent >= alert_bound:
             return '🟠'
-        elif usage_percent >= 60:
+        elif usage_percent >= warning_bound:
             return '🟡'
-        elif usage_percent >= 40:
-            return '🔵'
         else:
             return '🟢'
     
@@ -519,7 +517,7 @@ class VPSMonitor:
         logger.info(f"检查完成: 成功 {len(results)}/{len(vps_configs)}")
         return results, failed
     
-    def send_detailed_report(self, vps_list: List[Dict], threshold: float = 80, failed_names: List[str] = None):
+    def send_detailed_report(self, vps_list: List[Dict], critical_threshold: float = 90, alert_threshold: float = 80, warning_threshold: float = 60, failed_names: List[str] = None):
         """发送详细报告（分层展示 + 历史对比 + 动态总结）"""
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         next_run_time, next_run_desc = CronParser.get_next_run_time()
@@ -531,12 +529,17 @@ class VPSMonitor:
             for v in last_history.get('vps', []):
                 last_map[v['name']] = v.get('used_gb')
 
+        # 四级分组，边界完全由配置驱动
+        critical_bound = critical_threshold
+        alert_bound = alert_threshold
+        warning_bound = warning_threshold
+
         # ==================== 分级统计 ====================
         total_count = len(vps_list)
-        critical = [v for v in vps_list if v['bandwidth']['usage_percent'] >= 90]
-        alert = [v for v in vps_list if 80 <= v['bandwidth']['usage_percent'] < 90]
-        warning = [v for v in vps_list if 60 <= v['bandwidth']['usage_percent'] < 80]
-        normal = [v for v in vps_list if v['bandwidth']['usage_percent'] < 60]
+        critical = [v for v in vps_list if v['bandwidth']['usage_percent'] >= critical_bound]
+        alert    = [v for v in vps_list if alert_bound <= v['bandwidth']['usage_percent'] < critical_bound]
+        warning  = [v for v in vps_list if warning_bound <= v['bandwidth']['usage_percent'] < alert_bound]
+        normal   = [v for v in vps_list if v['bandwidth']['usage_percent'] < warning_bound]
 
         total_bandwidth = sum(v['bandwidth']['total_gb'] for v in vps_list)
         total_used = sum(v['bandwidth']['used_gb'] for v in vps_list)
@@ -560,6 +563,7 @@ class VPSMonitor:
 
         text = f"## {status_emoji} VPS 流量监控报告\n\n"
         text += f"**检查时间**: {now}\n\n"
+        text += f"**阈值**: 🔴≥{critical_bound}% | 🟠≥{alert_bound}% | 🟡≥{warning_bound}%\n\n"
         text += "---\n\n"
 
         # ==================== 紧凑型总览 ====================
@@ -589,8 +593,8 @@ class VPSMonitor:
         # ==================== VPS 详细列表 ====================
         sorted_vps = sorted(vps_list, key=lambda x: x['bandwidth']['usage_percent'], reverse=True)
 
-        # 需要展开详情的 VPS（>=60% 或有异常状态）
-        detail_vps = [v for v in sorted_vps if v['bandwidth']['usage_percent'] >= 60 or v['suspended'] or v.get('ve_status') == 'stopped']
+        # 需要展开详情的 VPS（>=warning_bound 或有异常状态）
+        detail_vps = [v for v in sorted_vps if v['bandwidth']['usage_percent'] >= warning_bound or v['suspended'] or v.get('ve_status') == 'stopped']
         summary_vps = [v for v in sorted_vps if v not in detail_vps]
 
         # 展开详情的 VPS
@@ -598,7 +602,7 @@ class VPSMonitor:
             text += f"### 📋 需关注 ({len(detail_vps)}台)\n\n"
             for idx, vps in enumerate(detail_vps, 1):
                 bw = vps['bandwidth']
-                icon = self.get_status_icon(bw['usage_percent'])
+                icon = self.get_status_icon(bw['usage_percent'], critical_bound, alert_bound, warning_bound)
                 ve_label = self.get_ve_status_icon(vps.get('ve_status', 'unknown'), vps['suspended'])
                 trend = self.get_trend_arrow(bw['used_gb'], last_map.get(vps['name']))
                 burn_label = self.get_burn_rate_label(bw.get('burn_rate', 0))
@@ -626,9 +630,9 @@ class VPSMonitor:
 
                 text += f"- 位置: {vps['location']} | 套餐: {vps['plan']}\n"
 
-                if bw['usage_percent'] >= 90:
+                if bw['usage_percent'] >= critical_bound:
                     text += f"- 🚨 **紧急: 流量即将耗尽**\n"
-                elif bw['usage_percent'] >= 80:
+                elif bw['usage_percent'] >= warning_bound:
                     text += f"- ⚠️ **警告: 建议清理或升级**\n"
 
                 text += "\n---\n\n"
@@ -668,14 +672,14 @@ class VPSMonitor:
             text += f"> 📅 {next_run_desc}\n"
 
         # ==================== 发送 ====================
-        at_all = len(critical) > 0 or len(alert) > 0
+        at_all = any(v['bandwidth']['usage_percent'] >= alert_bound for v in vps_list)
         self.robot.send_markdown(title=title, text=text, at_all=at_all)
 
         # 🔴 级别额外发送独立告警卡片
         if critical:
-            self.robot.send_alert_card(critical)
+            self.robot.send_alert_card(critical, critical_bound)
     
-    def monitor_and_report(self, vps_configs: List[Dict], threshold: float = 80):
+    def monitor_and_report(self, vps_configs: List[Dict], critical_threshold: float = 90, alert_threshold: float = 80, warning_threshold: float = 60):
         """监控并发送详细报告"""
         results, failed = self.check_vps_list(vps_configs)
 
@@ -684,17 +688,22 @@ class VPSMonitor:
             return
 
         if results:
-            self.send_detailed_report(results, threshold, failed_names=failed)
+            self.send_detailed_report(results, critical_threshold, alert_threshold, warning_threshold, failed_names=failed)
             save_history(results)
         else:
             logger.error(f"❌ 所有 VPS 查询失败: {failed}")
+            self.robot.send_markdown(
+                title='❌ VPS 监控异常',
+                text=f"## ❌ 监控执行失败\n\n所有 VPS 查询均失败，请检查网络或 API 密钥。\n\n**失败列表**: {', '.join(failed)}\n\n**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                at_all=True
+            )
             return
 
-        alerts = [v for v in results if v['bandwidth']['usage_percent'] >= threshold]
+        alerts = [v for v in results if v['bandwidth']['usage_percent'] >= alert_threshold]
         if alerts:
-            logger.warning(f"⚠️  发现 {len(alerts)} 台 VPS 超过阈值 {threshold}%")
+            logger.warning(f"⚠️  发现 {len(alerts)} 台 VPS 超过阈值 {alert_threshold}%")
         else:
-            logger.info(f"✅ 所有 VPS 流量正常（低于 {threshold}%）")
+            logger.info(f"✅ 所有 VPS 流量正常（低于 {alert_threshold}%）")
 
 
 def load_config(config_file: str = None) -> Dict:
@@ -721,14 +730,33 @@ def load_config(config_file: str = None) -> Dict:
         errors.append("缺少 dingtalk.webhook")
     if 'vps_list' not in config or not isinstance(config.get('vps_list'), list):
         errors.append("缺少 vps_list 或格式不是数组")
+    elif len(config['vps_list']) == 0:
+        errors.append("vps_list 不能为空")
     else:
         for i, vps in enumerate(config['vps_list']):
-            if 'veid' not in vps or 'api_key' not in vps:
+            if not isinstance(vps, dict):
+                errors.append(f"vps_list[{i}] 必须是对象，实际是 {type(vps).__name__}")
+            elif 'veid' not in vps or 'api_key' not in vps:
                 errors.append(f"vps_list[{i}] 缺少 veid 或 api_key")
     if 'monitor' not in config or not isinstance(config.get('monitor'), dict):
         errors.append("缺少 monitor 配置段")
     elif 'alert_threshold' not in config['monitor']:
         errors.append("缺少 monitor.alert_threshold")
+    else:
+        alert_t = config['monitor']['alert_threshold']
+        warning_t = config['monitor'].get('warning_threshold', 60)
+        critical_t = config['monitor'].get('critical_threshold', 90)
+        # bool 是 int 子类，需显式排除
+        def _is_number(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+        if not _is_number(alert_t):
+            errors.append("monitor.alert_threshold 必须是数字（非布尔）")
+        elif not _is_number(warning_t):
+            errors.append("monitor.warning_threshold 必须是数字（非布尔）")
+        elif not _is_number(critical_t):
+            errors.append("monitor.critical_threshold 必须是数字（非布尔）")
+        elif not (0 <= warning_t < alert_t < critical_t <= 100):
+            errors.append(f"阈值顺序错误: warning({warning_t}) < alert({alert_t}) < critical({critical_t}) 必须成立")
 
     if errors:
         for e in errors:
@@ -740,7 +768,7 @@ def load_config(config_file: str = None) -> Dict:
     if 'secret' in config['dingtalk']:
         config['dingtalk']['secret'] = os.environ.get('DINGTALK_SECRET', config['dingtalk']['secret'])
     for vps in config['vps_list']:
-        env_key = f"VPS_{vps.get('name', vps['veid']).replace('-', '_').upper()}_API_KEY"
+        env_key = f"VPS_{vps['veid']}_API_KEY"
         vps['api_key'] = os.environ.get(env_key, vps['api_key'])
 
     return config
@@ -805,7 +833,9 @@ def main():
     # 执行监控并发送详细报告
     monitor.monitor_and_report(
         vps_configs=config['vps_list'],
-        threshold=config['monitor']['alert_threshold']
+        critical_threshold=config['monitor'].get('critical_threshold', 90),
+        alert_threshold=config['monitor']['alert_threshold'],
+        warning_threshold=config['monitor'].get('warning_threshold', 60)
     )
 
     logger.info("=" * 50)
