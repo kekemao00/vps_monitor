@@ -11,6 +11,7 @@
     }
   ],
   "monitor": {
+    "critical_threshold": 90,
     "alert_threshold": 80,
     "warning_threshold": 60
   }
