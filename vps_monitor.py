@@ -212,26 +212,18 @@ class DingTalkRobot:
         return self._send_request(data)
 
     def send_alert_card(self, critical_vps: List[Dict], critical_threshold: float = 90):
-        """发送独立 ActionCard 告警，确保紧急信息不被长报告淹没"""
-        data = {
-            'msgtype': 'actionCard',
-            'actionCard': {
-                'title': f'🚨 {len(critical_vps)} 台 VPS 流量紧急',
-                'text': f'## 🚨 流量紧急告警\n\n'
-                        f'以下服务器流量使用超过 {critical_threshold}%:\n\n' +
-                        '\n'.join([
-                            f'- **{v["name"]}**: {v["bandwidth"]["usage_percent"]}% '
-                            f'(剩余 {v["bandwidth"]["remaining_gb"]} GB，'
-                            f'约 {v["bandwidth"]["estimated_days_left"]} 天)'
-                            for v in critical_vps
-                        ]),
-                'btnOrientation': '0',
-                'singleTitle': '查看详情',
-                'singleURL': 'dingtalk://dingtalkclient/action/openapp'
-            },
-            'at': {'isAtAll': True}
-        }
-        self._send_request(data)
+        """发送独立告警消息，确保紧急信息不被长报告淹没"""
+        text = f"## 🚨 流量紧急告警\n\n"
+        text += f"以下服务器流量使用超过 {critical_threshold}%:\n\n"
+        for v in critical_vps:
+            bw = v['bandwidth']
+            text += f"- **{v['name']}**: {bw['usage_percent']}% (剩余 {bw['remaining_gb']} GB，约 {bw['estimated_days_left']} 天)\n"
+        text += f"\n> 请立即检查并处理"
+        self.send_markdown(
+            title=f'🚨 {len(critical_vps)} 台 VPS 流量紧急',
+            text=text,
+            at_all=True
+        )
 
     def _send_request(self, data: Dict, retries: int = 3) -> Dict:
         """发送请求到钉钉，网络异常自动重试"""
@@ -675,7 +667,7 @@ class VPSMonitor:
         at_all = any(v['bandwidth']['usage_percent'] >= alert_bound for v in vps_list)
         self.robot.send_markdown(title=title, text=text, at_all=at_all)
 
-        # 🔴 级别额外发送独立告警卡片
+        # 🔴 级别额外发送独立紧急告警消息
         if critical:
             self.robot.send_alert_card(critical, critical_bound)
     

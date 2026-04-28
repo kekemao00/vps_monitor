@@ -27,11 +27,11 @@ python3 vps_monitor.py --config /path/to/config.json
 单文件 Python 脚本 (`vps_monitor.py`)，四个核心类协作:
 
 - **CronParser** — 解析当前用户 crontab，计算下次执行时间，用于报告底部展示
-- **DingTalkRobot** — 钉钉自定义机器人封装，支持 HMAC-SHA256 加签认证，发送 Markdown 和 ActionCard 消息
+- **DingTalkRobot** — 钉钉自定义机器人封装，支持 HMAC-SHA256 加签认证，发送 Markdown 消息
 - **BandwagonAPI** — 搬瓦工 API 客户端，调用 `getServiceInfo` + `getLiveServiceInfo` 端点 (`api.64clouds.com/v1`)
 - **VPSMonitor** — 核心编排类，并发查询 VPS → 计算流量/预测超标 → 组装分层报告 → 调用钉钉发送
 
-数据流: `config.json` → `BandwagonAPI` (并发) → `VPSMonitor.calculate_bandwidth()` → `DingTalkRobot.send_markdown()` + 可选 `send_alert_card()`
+数据流: `config.json` → `BandwagonAPI` (并发) → `VPSMonitor.calculate_bandwidth()` → `DingTalkRobot.send_markdown()` + 可选独立紧急告警消息
 
 辅助函数: `load_last_history()` 读取上次执行记录用于趋势对比，`save_history()` 追加写入 `history.jsonl`
 
@@ -53,7 +53,7 @@ python3 vps_monitor.py --config /path/to/config.json
 - 流量超标预测: 基于日均使用量线性外推至重置日
 - 消耗速率分级: `burn_rate` = 实际日均 / 理论均匀日均，>1.5 标记⚡偏快，<0.5 标记🐢很低
 - 钉钉消息在有 ≥alert_threshold 的 VPS 时触发 @所有人
-- 🔴 级别额外发送独立 ActionCard 告警卡片
+- 🔴 级别额外发送独立紧急告警消息（Markdown 格式，@所有人）
 - 报告分层展示: ≥warning 的 VPS 展开详情，正常 VPS 折叠为一行摘要
 - 历史对比: 从 `history.jsonl` 读取上次数据，展示趋势箭头 (↑↗→↘)
 
