@@ -79,6 +79,18 @@ python3 vps_monitor.py
 python3 vps_monitor.py --config /path/to/config.json
 ```
 
+预览消息内容（只打印到终端，不发送钉钉、不写历史记录）：
+
+```bash
+python3 vps_monitor.py --dry-run
+```
+
+运行单元测试：
+
+```bash
+python3 -m unittest discover -s tests
+```
+
 ## 配置说明
 
 ### 阈值配置
@@ -86,7 +98,7 @@ python3 vps_monitor.py --config /path/to/config.json
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `critical_threshold` | 90 | 🔴 严重预警阈值，触发独立告警消息 |
-| `alert_threshold` | 80 | 🟠 预警阈值，触发 @所有人 |
+| `alert_threshold` | 80 | 🟠 预警阈值，触发 @所有人（有 🔴 时只由紧急告警 @ 一次） |
 | `warning_threshold` | 60 | 🟡 警告阈值，报告中展开详情 |
 
 约束：`warning_threshold < alert_threshold < critical_threshold`
@@ -133,6 +145,7 @@ vps_monitor/
 ├── config.json             # 配置文件（含敏感信息，已 gitignore）
 ├── config.example.json     # 配置示例
 ├── requirements.txt        # Python 依赖
+├── tests/                  # 单元测试
 ├── history.jsonl           # 执行历史（自动生成）
 ├── monitor.log             # 运行日志（自动轮转，5MB x 3）
 ├── LICENSE                 # MIT 开源协议
