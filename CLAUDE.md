@@ -15,6 +15,12 @@ python3 vps_monitor.py
 # 指定配置文件
 python3 vps_monitor.py --config /path/to/config.json
 
+# 只打印消息、不发送不写历史
+python3 vps_monitor.py --dry-run
+
+# 单元测试
+python3 -m unittest discover -s tests
+
 # 生产部署路径: /opt/vps_monitor/
 # crontab 示例 (每天 9:00 和 21:00):
 # 0 9,21 * * * /usr/bin/python3 /opt/vps_monitor/vps_monitor.py >> /opt/vps_monitor/cron.log 2>&1
@@ -52,7 +58,7 @@ python3 vps_monitor.py --config /path/to/config.json
 - 预警分四级: 🟢 <warning / 🟡 warning-alert / 🟠 alert-critical / 🔴 ≥critical，边界完全由配置驱动
 - 流量超标预测: 基于日均使用量线性外推至重置日
 - 消耗速率分级: `burn_rate` = 实际日均 / 理论均匀日均，>1.5 标记⚡偏快，<0.5 标记🐢很低
-- 钉钉消息在有 ≥alert_threshold 的 VPS 时触发 @所有人
+- 钉钉消息在有 ≥alert_threshold 的 VPS 时触发 @所有人；存在 🔴 时改由独立告警 @所有人，主报告不再 @，避免重复提醒
 - 🔴 级别额外发送独立紧急告警消息（Markdown 格式，@所有人）
 - 报告分层展示: ≥warning 的 VPS 展开详情，正常 VPS 折叠为一行摘要
 - 历史对比: 从 `history.jsonl` 读取上次数据，展示趋势箭头 (↑↗→↘)
@@ -62,4 +68,7 @@ python3 vps_monitor.py --config /path/to/config.json
 - 路径以脚本所在目录为基准（`SCRIPT_DIR`），支持 `--config` 参数覆盖
 - 日志使用 RotatingFileHandler，5MB 轮转，保留 3 份
 - API 调用和钉钉发送均有指数退避重试（3次）
-- 全部 VPS 查询失败时会发送钉钉失败通知
+- 全部 VPS 查询失败时会发送钉钉失败通知（列出每台失败原因），进程退出码为 1
+- 报告标题即通知预览，直接点名最严重的 VPS 与使用率
+- 异常日志中 URL 携带的 api_key / access_token / sign 会被 `redact()` 脱敏
+- 周期起始日按自然月反推（`data_next_reset` 往前一个月），日均用带小数的已过天数计算
