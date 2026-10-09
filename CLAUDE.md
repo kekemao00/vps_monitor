@@ -18,6 +18,9 @@ python3 vps_monitor.py --config /path/to/config.json
 # 只打印消息、不发送不写历史
 python3 vps_monitor.py --dry-run
 
+# @机器人 指令服务（常驻，Stream 模式）；--cli 在终端测试指令
+python3 dingtalk_bot.py [--cli]
+
 # 单元测试
 python3 -m unittest discover -s tests
 
@@ -26,7 +29,7 @@ python3 -m unittest discover -s tests
 # 0 9,21 * * * /usr/bin/python3 /opt/vps_monitor/vps_monitor.py >> /opt/vps_monitor/cron.log 2>&1
 ```
 
-依赖: `requests>=2.28.0` (见 requirements.txt)
+依赖: `requests>=2.28.0`；指令服务另需 `dingtalk-stream` (见 requirements.txt)
 
 ## 架构
 
@@ -39,11 +42,14 @@ python3 -m unittest discover -s tests
 
 数据流: `config.json` → `BandwagonAPI` (并发) → `VPSMonitor.calculate_bandwidth()` → `DingTalkRobot.send_markdown()` + 可选独立紧急告警消息
 
+指令服务 `dingtalk_bot.py`: 企业内部应用机器人 + Stream 模式（无需公网 IP）。`CommandHandler.handle(text)` 纯函数式解析指令（状态/查询 名称/列表/帮助）并复用 `build_report()` / `render_vps_detail()` 生成回复，只读、不写历史；`run_stream()` 先 ACK 再在线程池查询，经 `sessionWebhook` 回复
+
 辅助函数: `load_last_history()` 读取上次执行记录用于趋势对比，`save_history()` 追加写入 `history.jsonl`
 
 ## 配置文件 (config.json)
 
 - `dingtalk.webhook` / `dingtalk.secret` — 钉钉机器人凭据
+- `dingtalk_bot.client_id` / `client_secret` — 可选，@机器人 指令服务的应用凭据（环境变量 `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET`）
 - `vps_list[]` — 每台 VPS 的 `veid`、`api_key`、`name`（不能为空）
 - `monitor.critical_threshold` — 🔴 严重预警阈值 (默认 90)
 - `monitor.alert_threshold` — 🟠 预警阈值 (必填，如 80)
