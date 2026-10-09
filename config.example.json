@@ -3,6 +3,10 @@
     "webhook": "https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN",
     "secret": "SEC_YOUR_DINGTALK_SECRET"
   },
+  "dingtalk_bot": {
+    "client_id": "YOUR_APP_CLIENT_ID",
+    "client_secret": "YOUR_APP_CLIENT_SECRET"
+  },
   "vps_list": [
     {
       "veid": "YOUR_VEID",

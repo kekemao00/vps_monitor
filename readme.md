@@ -18,6 +18,7 @@
 - **并发查询** — 多台 VPS 并行采集，大幅缩短执行时间
 - **自动重试** — API 和钉钉发送均支持指数退避重试
 - **环境变量覆盖** — 敏感信息支持从环境变量读取，安全部署
+- **群内 @机器人 查询** — 发「状态」「查询 名称」即时回复，Stream 模式无需公网 IP
 
 ## 快速开始
 
@@ -137,17 +138,88 @@ crontab -e
 sudo systemctl status cron
 ```
 
+## 群内 @机器人 查询（可选）
+
+在群里 @机器人 发指令即时查询，不用等定时报告：
+
+| 指令 | 作用 |
+|------|------|
+| `状态` / `status` | 查询全部 VPS，内容同定时报告（不写历史，不影响「较上次」） |
+| `查询 名称` / `query 名称` | 单台 VPS 详情，名称可写 veid 或名称片段 |
+| `列表` / `list` | 列出已配置的 VPS |
+| `帮助` / `help` | 显示指令说明 |
+
+定时报告用的「自定义机器人」（webhook）只能发不能收，所以 @ 查询需要另建一个**企业内部应用机器人**，用 Stream 模式接收消息：程序主动连钉钉，**不需要公网 IP、域名或回调地址**。两个机器人可以放在同一个群里。
+
+### 1. 创建机器人
+
+1. 登录 [钉钉开放平台](https://open-dev.dingtalk.com/)（需要是企业/团队的管理员或开发者，个人可免费创建一个团队）
+2. 应用开发 → 企业内部应用 → 创建应用
+3. 应用能力 → 添加「机器人」，消息接收模式选 **Stream 模式**，保存并发布
+4. 凭证与基础信息 → 复制 **Client ID** 和 **Client Secret**
+5. 版本管理与发布 → 发布应用
+6. 在目标群：群设置 → 机器人 → 添加机器人 → 选择刚创建的应用机器人
+
+### 2. 配置并启动
+
+在 `config.json` 加入（也可用环境变量 `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET`）：
+
+```json
+"dingtalk_bot": {
+  "client_id": "dingxxxxxxxx",
+  "client_secret": "xxxxxxxx"
+}
+```
+
+```bash
+pip install -r requirements.txt
+
+# 先在终端试指令，不连钉钉
+python3 dingtalk_bot.py --cli
+
+# 正式运行（常驻进程）
+python3 dingtalk_bot.py
+```
+
+### 3. 用 systemd 常驻
+
+```ini
+# /etc/systemd/system/vps-monitor-bot.service
+[Unit]
+Description=VPS Monitor DingTalk Bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/vps_monitor
+ExecStart=/usr/bin/python3 /opt/vps_monitor/dingtalk_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now vps-monitor-bot
+journalctl -u vps-monitor-bot -f   # 或查看 bot.log
+```
+
+> 指令都是只读查询；企业内部机器人只有本企业/团队成员能 @ 到或私聊。
+
 ## 项目结构
 
 ```
 vps_monitor/
-├── vps_monitor.py          # 主程序
+├── vps_monitor.py          # 主程序（定时报告）
+├── dingtalk_bot.py         # @机器人 指令服务（可选，常驻）
 ├── config.json             # 配置文件（含敏感信息，已 gitignore）
 ├── config.example.json     # 配置示例
 ├── requirements.txt        # Python 依赖
 ├── tests/                  # 单元测试
 ├── history.jsonl           # 执行历史（自动生成）
 ├── monitor.log             # 运行日志（自动轮转，5MB x 3）
+├── bot.log                 # 指令服务日志
 ├── LICENSE                 # MIT 开源协议
 └── README.md               # 本文件
 ```

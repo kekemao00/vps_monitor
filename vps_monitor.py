@@ -646,6 +646,45 @@ class VPSMonitor:
         logger.info(f"检查完成: 成功 {len(results)}/{len(vps_configs)}")
         return [results[i] for i in sorted(results)], [failed[i] for i in sorted(failed)]
 
+    def render_vps_detail(self, vps: Dict, critical_threshold: float = 90, alert_threshold: float = 80,
+                          warning_threshold: float = 60, last_gb: Optional[float] = None) -> str:
+        """单台 VPS 的详情块（报告展开项与 @机器人 查询共用）"""
+        bw = vps['bandwidth']
+        icon = self.get_status_icon(bw['usage_percent'], critical_threshold, alert_threshold, warning_threshold)
+        trend = self.get_trend_arrow(bw['used_gb'], last_gb)
+        burn_label = self.get_burn_rate_label(bw['burn_rate'])
+
+        text = f"#### {icon} {vps['name']} · {fmt_pct(bw['usage_percent'])}\n\n"
+        text += f"{self.get_progress_bar(bw['usage_percent'])}\n\n"
+        if self.is_abnormal_state(vps) or vps.get('ve_status') not in ('running', 'unknown'):
+            text += f"- 状态：**{self.get_ve_status_icon(vps.get('ve_status'), vps['suspended'])}**\n"
+        used_line = f"- 已用 **{bw['used_gb']:.1f} / {bw['total_gb']:.1f} GB**"
+        if trend:
+            used_line += f"，较上次 {trend}"
+        text += used_line + "\n"
+        text += f"- {self.describe_remaining(bw)}\n"
+        if bw['reset_valid']:
+            text += f"- 重置：{bw['reset_datetime']}（{bw['reset_in']}后）"
+            if bw['will_exceed']:
+                text += f"，届时预计用到 {bw['predicted_usage']:.0f} GB，**会超额**"
+            text += "\n"
+        else:
+            text += "- 重置：时间未知\n"
+        if bw['daily_avg'] > 0 and bw['reset_valid']:
+            text += f"- 日均 {bw['daily_avg']:.1f} GB"
+            if burn_label:
+                text += f" {burn_label}"
+            text += "\n"
+        text += f"- {vps['location']} · {vps['plan']}\n"
+
+        if bw['usage_percent'] >= critical_threshold:
+            text += "- 💡 **流量即将耗尽**，请立即限速/暂停高流量服务或升级套餐\n"
+        elif bw['usage_percent'] >= alert_threshold:
+            text += "- 💡 建议排查流量来源，必要时限速或升级套餐\n"
+        elif bw['will_exceed']:
+            text += "- 💡 消耗偏快，建议留意流量来源\n"
+        return text
+
     @staticmethod
     def _headline(vps: Dict, others: int) -> str:
         """标题中的主角：名称 + 使用率（+ 等 N 台）"""
@@ -730,41 +769,8 @@ class VPSMonitor:
         summary_vps = [v for v in sorted_vps if v not in detail_vps]
 
         for vps in detail_vps:
-            bw = vps['bandwidth']
-            icon = self.get_status_icon(bw['usage_percent'], critical_threshold, alert_threshold, warning_threshold)
-            trend = self.get_trend_arrow(bw['used_gb'], last_used(vps))
-            burn_label = self.get_burn_rate_label(bw['burn_rate'])
-
-            text += f"#### {icon} {vps['name']} · {fmt_pct(bw['usage_percent'])}\n\n"
-            text += f"{self.get_progress_bar(bw['usage_percent'])}\n\n"
-            if self.is_abnormal_state(vps) or vps.get('ve_status') not in ('running', 'unknown'):
-                text += f"- 状态：**{self.get_ve_status_icon(vps.get('ve_status'), vps['suspended'])}**\n"
-            used_line = f"- 已用 **{bw['used_gb']:.1f} / {bw['total_gb']:.1f} GB**"
-            if trend:
-                used_line += f"，较上次 {trend}"
-            text += used_line + "\n"
-            text += f"- {self.describe_remaining(bw)}\n"
-            if bw['reset_valid']:
-                text += f"- 重置：{bw['reset_datetime']}（{bw['reset_in']}后）"
-                if bw['will_exceed']:
-                    text += f"，届时预计用到 {bw['predicted_usage']:.0f} GB，**会超额**"
-                text += "\n"
-            else:
-                text += "- 重置：时间未知\n"
-            if bw['daily_avg'] > 0 and bw['reset_valid']:
-                text += f"- 日均 {bw['daily_avg']:.1f} GB"
-                if burn_label:
-                    text += f" {burn_label}"
-                text += "\n"
-            text += f"- {vps['location']} · {vps['plan']}\n"
-
-            if bw['usage_percent'] >= critical_threshold:
-                text += "- 💡 **流量即将耗尽**，请立即限速/暂停高流量服务或升级套餐\n"
-            elif bw['usage_percent'] >= alert_threshold:
-                text += "- 💡 建议排查流量来源，必要时限速或升级套餐\n"
-            elif bw['will_exceed']:
-                text += "- 💡 消耗偏快，建议留意流量来源\n"
-
+            text += self.render_vps_detail(vps, critical_threshold, alert_threshold, warning_threshold,
+                                           last_used(vps))
             text += "\n---\n\n"
 
         # ==================== 正常：折叠为一行 ====================
@@ -844,8 +850,8 @@ class VPSMonitor:
         return sent
 
 
-def load_config(config_file: str = None) -> Dict:
-    """加载并校验配置文件，敏感字段支持环境变量覆盖"""
+def load_config(config_file: str = None, require_webhook: bool = True) -> Dict:
+    """加载并校验配置文件，敏感字段支持环境变量覆盖；@机器人 指令服务不发 webhook，可跳过其校验"""
     if config_file is None:
         config_file = str(SCRIPT_DIR / 'config.json')
 
@@ -876,7 +882,9 @@ def load_config(config_file: str = None) -> Dict:
 
     # 配置 schema 校验
     errors = []
-    if not isinstance(dingtalk, dict):
+    if not require_webhook:
+        pass  # 指令服务只通过 sessionWebhook 回复，不需要群 webhook
+    elif not isinstance(dingtalk, dict):
         errors.append("缺少 dingtalk 配置段")
     elif not isinstance(dingtalk.get('webhook'), str) or not dingtalk['webhook'].startswith('http'):
         errors.append("缺少 dingtalk.webhook 或格式不正确（应以 http 开头）")
