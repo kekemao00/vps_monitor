@@ -1,0 +1,147 @@
+name: VPS 流量报告
+# Actions 页面上每次运行的名称标明触发方式。同一时段会有几路触发，
+# 只有先到的那次推送，其余的点进去 Summary 写着「已经推送过，跳过」
+run-name: >-
+  ${{ format('VPS 流量报告 · {0}',
+  github.event_name == 'schedule' && 'GitHub 兜底'
+  || inputs.dry_run && '预览'
+  || inputs.scheduled && '准点触发'
+  || '手动推送') }}
+
+# 这是可选的部署方式，和服务器 crontab 部署二选一，说明见 README「部署方式二：GitHub Actions」。
+# 准点推送靠外部定时服务（如 cron-job.org）在每个报告时段调用 workflow_dispatch（带 scheduled=true）；
+# 下面 GitHub 自带的定时任务只作兜底：它不保证准点，高峰期会延迟几十分钟到几小时，甚至直接丢弃。
+# 几路触发都会到达，每个时段谁先到谁推送，后到的读到这个时段已推送过就跳过
+on:
+  schedule:
+    # 兜底时间排在准点时段之后，并避开 GitHub 最拥挤的整点。cron 用 UTC，等于北京时间减 8 小时
+    - cron: "17 1 * * *"   # 北京时间 09:17
+    - cron: "7 2 * * *"    # 北京时间 10:07
+    - cron: "7 3 * * *"    # 北京时间 11:07
+    - cron: "17 13 * * *"  # 北京时间 21:17
+    - cron: "7 14 * * *"   # 北京时间 22:07
+    - cron: "7 15 * * *"   # 北京时间 23:07
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 只生成预览，不发送到钉钉
+        type: boolean
+        default: true
+      scheduled:
+        description: 外部定时服务调用时用，手动运行不用勾：当前时段已经推送过就跳过
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 同一时间只跑一次，后到的触发排队，等前一次把「已推送」记录保存好再判断
+concurrency:
+  group: vps-monitor-report
+  cancel-in-progress: false
+
+env:
+  # 报告时段，改的时候同步改上面的兜底 cron 和外部定时服务的时间
+  VPS_MONITOR_SLOTS: "09:00,21:00"
+  # 兜底触发晚于时段多少分钟就不再推送（留给下一个时段），避免深夜打扰
+  VPS_MONITOR_MAX_DELAY: "180"
+  # Runner 默认 UTC，报告里的时间按北京时间显示
+  TZ: Asia/Shanghai
+
+jobs:
+  # 查询并推送：能读到密钥，但没有写仓库的权限
+  report:
+    # GitHub 自带的定时任务要在仓库变量里打开开关才运行，避免和服务器部署重复推送；手动运行和外部触发不受影响
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.VPS_MONITOR_ACTIONS == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      skipped: ${{ steps.report.outputs.skipped }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 第一次运行时 state 分支还不存在，这一步会失败，程序按第一次运行处理
+      - name: 读取历史记录
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        with:
+          ref: state
+          path: .state
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # 定时报告只需要 requests；dingtalk-stream 是常驻 @机器人 用的，Actions 上用不到
+      - run: python -m pip install "requests>=2.28.0"
+
+      - name: 写入配置
+        env:
+          VPS_MONITOR_CONFIG: ${{ secrets.VPS_MONITOR_CONFIG }}
+        run: |
+          if [ -z "$VPS_MONITOR_CONFIG" ]; then
+            echo "::error::缺少 VPS_MONITOR_CONFIG：请在 Settings → Secrets and variables → Actions 里添加，内容是完整的 config.json"
+            exit 1
+          fi
+          printf '%s' "$VPS_MONITOR_CONFIG" > "$RUNNER_TEMP/config.json"
+
+      - name: 查询并推送报告
+        id: report
+        run: python vps_monitor.py --config "$RUNNER_TEMP/config.json" --state-dir .state ${{ inputs.dry_run && '--dry-run' || '' }}
+        env:
+          # 外部定时服务触发时带 scheduled=true；GitHub 自带的定时触发由程序按 GITHUB_EVENT_NAME 自动识别
+          VPS_MONITOR_SCHEDULED: ${{ inputs.scheduled }}
+          # 可选：单独存的钉钉凭据会覆盖 config.json 里的值
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+
+      # 交给下一个任务提交。.state 是隐藏目录，默认会被整个跳过，
+      # 所以要打开 include-hidden-files，再单独排除 checkout 留下的 .git。
+      # 预览和「已推送过」的跳过不会改动历史记录，不用上传
+      - name: 上传历史记录
+        if: ${{ inputs.dry_run != true && steps.report.outputs.skipped != 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: state
+          path: |
+            .state/
+            !.state/.git/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  # 保存：只有这个任务能写仓库，而且只写 state 分支；这里不接触任何密钥
+  save:
+    needs: report
+    if: ${{ inputs.dry_run != true && needs.report.outputs.skipped != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 取出 state 分支
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        with:
+          ref: state
+          path: .state
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: state
+          path: .state
+
+      - name: 提交历史记录
+        run: scripts/save_state.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
