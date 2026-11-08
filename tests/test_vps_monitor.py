@@ -1,4 +1,7 @@
+import json
+import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -140,6 +143,85 @@ class ReportTest(unittest.TestCase):
             monitor.send_detailed_report([make_vps('1', 'a', 950, self.now)], 90, 80, 60)
         self.assertFalse(robot.send_markdown.call_args.kwargs['at_all'])
         robot.send_alert_card.assert_called_once()
+
+
+class ReportSlotsTest(unittest.TestCase):
+    slots = vm.ReportSlots('21:00, 09:00', max_delay_minutes=180)
+
+    def test_parse(self):
+        self.assertEqual(self.slots.times, [(9, 0), (21, 0)])
+        self.assertEqual(self.slots.describe(), '每天 09:00、21:00')
+        for bad in ('', '9', '25:00', '09:60', 'abc'):
+            with self.assertRaises(ValueError):
+                vm.ReportSlots.parse(bad)
+
+    def test_current_slot(self):
+        self.assertEqual(self.slots.current(datetime(2026, 10, 3, 9, 1)), datetime(2026, 10, 3, 9, 0))
+        # 略早于时段的触发也算这个时段
+        self.assertEqual(self.slots.current(datetime(2026, 10, 3, 8, 55)), datetime(2026, 10, 3, 9, 0))
+        self.assertEqual(self.slots.current(datetime(2026, 10, 3, 20, 0)), datetime(2026, 10, 3, 9, 0))
+        # 凌晨属于前一天晚上的时段
+        self.assertEqual(self.slots.current(datetime(2026, 10, 3, 1, 0)), datetime(2026, 10, 2, 21, 0))
+
+    def test_next_run(self):
+        self.assertEqual(self.slots.next_run(datetime(2026, 10, 3, 9, 1)), (datetime(2026, 10, 3, 21, 0), '每天 09:00、21:00'))
+        self.assertEqual(self.slots.next_run(datetime(2026, 10, 3, 22, 0))[0], datetime(2026, 10, 4, 9, 0))
+
+    def test_skip_reason(self):
+        now = datetime(2026, 10, 3, 9, 20)
+        self.assertIsNone(self.slots.skip_reason(now, {}))
+        self.assertIsNone(self.slots.skip_reason(now, {'last_slot': '2026-10-02 21:00'}))
+        self.assertIn('已经推送过', self.slots.skip_reason(now, {'last_slot': '2026-10-03 09:00'}))
+        self.assertIn('超过', self.slots.skip_reason(datetime(2026, 10, 3, 12, 30), {}))
+
+
+class ScheduledMainTest(unittest.TestCase):
+    """--scheduled：同一时段多路触发只推送一次，发送失败不记时段"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, vm, 'STATE_DIR', vm.STATE_DIR)
+        self.config = {'dingtalk': {'webhook': 'http://x'}, 'vps_list': [], 'monitor': {'alert_threshold': 80}}
+
+    def run_main(self, now, ok=True):
+        argv = ['vps_monitor.py', '--scheduled', '--slots', '09:00,21:00', '--state-dir', self.tmp.name]
+        fake_dt = mock.Mock(wraps=datetime)
+        fake_dt.now.return_value = now
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.dict(os.environ, {'GITHUB_EVENT_NAME': '', 'VPS_MONITOR_SCHEDULED': ''}), \
+                mock.patch.object(vm, 'setup_logging'), \
+                mock.patch.object(vm, 'datetime', fake_dt), \
+                mock.patch.object(vm, 'load_config', return_value=self.config), \
+                mock.patch.object(vm.VPSMonitor, 'monitor_and_report', return_value=ok) as run:
+            with self.assertRaises(SystemExit) as exit_:
+                vm.main()
+        return exit_.exception.code, run
+
+    def state(self):
+        path = Path(self.tmp.name) / 'state.json'
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def test_second_trigger_in_same_slot_skips(self):
+        code, run = self.run_main(datetime(2026, 10, 3, 9, 1))
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        self.assertEqual(self.state(), {'last_slot': '2026-10-03 09:00'})
+
+        code, run = self.run_main(datetime(2026, 10, 3, 9, 40))
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+
+        code, run = self.run_main(datetime(2026, 10, 3, 21, 2))
+        run.assert_called_once()
+        self.assertEqual(self.state(), {'last_slot': '2026-10-03 21:00'})
+
+    def test_failed_send_leaves_slot_for_retry(self):
+        code, run = self.run_main(datetime(2026, 10, 3, 9, 1), ok=False)
+        self.assertEqual(code, 1)
+        self.assertIsNone(self.state())
+        code, run = self.run_main(datetime(2026, 10, 3, 10, 7))
+        run.assert_called_once()
 
 
 class RedactTest(unittest.TestCase):

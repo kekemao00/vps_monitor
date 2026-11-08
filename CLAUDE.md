@@ -18,6 +18,9 @@ python3 vps_monitor.py --config /path/to/config.json
 # 只打印消息、不发送不写历史
 python3 vps_monitor.py --dry-run
 
+# 按时段去重的定时推送（GitHub Actions 部署用）；--state-dir 指定 history.jsonl / state.json 目录
+python3 vps_monitor.py --scheduled --slots 09:00,21:00 --state-dir .state
+
 # @机器人 指令服务（常驻，Stream 模式）；--cli 在终端测试指令
 python3 dingtalk_bot.py [--cli]
 
@@ -44,7 +47,13 @@ python3 -m unittest discover -s tests
 
 指令服务 `dingtalk_bot.py`: 企业内部应用机器人 + Stream 模式（无需公网 IP）。`CommandHandler.handle(text)` 纯函数式解析指令（状态/查询 名称/列表/帮助）并复用 `build_report()` / `render_vps_detail()` 生成回复，只读、不写历史；`run_stream()` 先 ACK 再在线程池查询，经 `sessionWebhook` 回复
 
-辅助函数: `load_last_history()` 读取上次执行记录用于趋势对比，`save_history()` 追加写入 `history.jsonl`
+辅助函数: `load_last_history()` 读取上次执行记录用于趋势对比，`save_history()` 追加写入 `history.jsonl`；两者与 `load_state()/save_state()` 都基于模块变量 `STATE_DIR`（默认 `SCRIPT_DIR`，`--state-dir` 覆盖）
+
+## 部署方式（二选一）
+
+- **服务器 crontab**：见上方 crontab 示例，页脚「下次检查」由 `CronParser` 读 crontab 得出
+- **GitHub Actions**：`.github/workflows/report.yml`。准点靠外部定时服务（cron-job.org）调 `workflow_dispatch`（`scheduled=true`），GitHub `schedule` 只作兜底（每时段后 3 次）；`ReportSlots` 按 `VPS_MONITOR_SLOTS` 计算当前时段，`state.json` 的 `last_slot` 已是该时段或触发晚于 `VPS_MONITOR_MAX_DELAY` 分钟则跳过（写 `GITHUB_OUTPUT skipped=true`）；仅报告发送成功才记时段。历史与 state 存在孤立分支 `state`，由无密钥的 `save` 任务经 `scripts/save_state.sh` 提交；定时触发需仓库变量 `VPS_MONITOR_ACTIONS=true`；配置来自 Secret `VPS_MONITOR_CONFIG`（完整 config.json）
+- @机器人 `dingtalk_bot.py` 是常驻进程，只能跑在常开机器上
 
 ## 配置文件 (config.json)
 
@@ -71,7 +80,8 @@ python3 -m unittest discover -s tests
 
 ## 注意事项
 
-- 路径以脚本所在目录为基准（`SCRIPT_DIR`），支持 `--config` 参数覆盖
+- 路径以脚本所在目录为基准（`SCRIPT_DIR`），支持 `--config` / `--state-dir` 参数覆盖
+- 在 GitHub Actions 中报告正文会写入 `GITHUB_STEP_SUMMARY`（`append_github_file()`，其他环境无操作）
 - 日志使用 RotatingFileHandler，5MB 轮转，保留 3 份
 - API 调用和钉钉发送均有指数退避重试（3次）
 - 全部 VPS 查询失败时会发送钉钉失败通知（列出每台失败原因），进程退出码为 1

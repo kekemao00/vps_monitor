@@ -27,6 +27,8 @@ from typing import List, Dict, Optional, Tuple, Set
 
 # 脚本所在目录，所有相对路径以此为基准
 SCRIPT_DIR = Path(__file__).resolve().parent
+# history.jsonl / state.json 所在目录，默认同脚本目录；GitHub Actions 部署时指向从 state 分支取出的目录
+STATE_DIR = SCRIPT_DIR
 
 # 钉钉 Markdown 消息体上限约 20000 字节，留出余量
 DINGTALK_MAX_BYTES = 18000
@@ -66,6 +68,18 @@ def fmt_pct(value: float) -> str:
 def fmt_gb(value: float) -> str:
     """流量统一保留 1 位小数"""
     return f"{value:.1f} GB"
+
+
+def append_github_file(env_name: str, content: str):
+    """在 GitHub Actions 中追加写 GITHUB_STEP_SUMMARY / GITHUB_OUTPUT，其他环境不做任何事"""
+    path = os.environ.get(env_name)
+    if not path:
+        return
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(content)
+    except OSError as e:
+        logger.warning(f"写入 {env_name} 失败: {e}")
 
 
 def fmt_duration(seconds: float) -> str:
@@ -225,6 +239,71 @@ class CronParser:
                 times = '、'.join(f"{h:02d}:{m:02d}" for h in hours)
                 return f"{prefix} {times}"
         return f"自定义周期 ({minute} {hour} {dom} {month} {dow})"
+
+
+class ReportSlots:
+    """按「报告时段」去重：同一时段多路触发（外部准点触发 + GitHub 兜底定时）只推送一次"""
+
+    # 触发略早于时段（外部服务时钟偏差、提前几分钟触发）也算作这个时段
+    EARLY_MINUTES = 10
+
+    def __init__(self, spec: str, max_delay_minutes: int = 180):
+        self.times = self.parse(spec)
+        self.max_delay = timedelta(minutes=max_delay_minutes)
+
+    @staticmethod
+    def parse(spec: str) -> List[Tuple[int, int]]:
+        """解析 "09:00,21:00" 为 [(9, 0), (21, 0)]，非法时抛出 ValueError"""
+        times = set()
+        for part in (spec or '').replace('，', ',').split(','):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.fullmatch(r'(\d{1,2}):(\d{2})', part)
+            if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+                raise ValueError(f"报告时段格式应为 HH:MM，实际是「{part}」")
+            times.add((int(m.group(1)), int(m.group(2))))
+        if not times:
+            raise ValueError("报告时段为空")
+        return sorted(times)
+
+    def current(self, now: datetime) -> datetime:
+        """本次触发所属的时段：不晚于 now（允许提前 EARLY_MINUTES）的最近一个时段"""
+        ref = now + timedelta(minutes=self.EARLY_MINUTES)
+        candidates = [
+            (ref - timedelta(days=offset)).replace(hour=h, minute=m, second=0, microsecond=0)
+            for offset in (0, 1) for h, m in self.times
+        ]
+        return max(c for c in candidates if c <= ref)
+
+    def next_after(self, now: datetime) -> datetime:
+        """now 之后的下一个时段，用于报告页脚的「下次检查」"""
+        candidates = [
+            (now + timedelta(days=offset)).replace(hour=h, minute=m, second=0, microsecond=0)
+            for offset in (0, 1) for h, m in self.times
+        ]
+        return min(c for c in candidates if c > now)
+
+    def describe(self) -> str:
+        return '每天 ' + '、'.join(f"{h:02d}:{m:02d}" for h, m in self.times)
+
+    def next_run(self, now: datetime = None) -> Tuple[Optional[datetime], str]:
+        """与 CronParser.get_next_run_time() 同样的返回格式"""
+        return self.next_after(now or datetime.now()), self.describe()
+
+    @staticmethod
+    def key(slot: datetime) -> str:
+        return slot.strftime('%Y-%m-%d %H:%M')
+
+    def skip_reason(self, now: datetime, state: Dict) -> Optional[str]:
+        """本次定时触发不该推送的原因；返回 None 表示应当推送"""
+        slot = self.current(now)
+        if state.get('last_slot') == self.key(slot):
+            return f"{self.key(slot)} 时段已经推送过，本次触发跳过"
+        # GitHub 兜底定时可能被拖延数小时，太晚就不推，留给下一个时段，避免深夜打扰
+        if now - slot > self.max_delay:
+            return f"触发时间 {now:%H:%M} 距 {self.key(slot)} 时段已超过 {fmt_duration(self.max_delay.total_seconds())}，本次跳过，等下一个时段"
+        return None
 
 
 class DingTalkRobot:
@@ -805,12 +884,15 @@ class VPSMonitor:
         return title, text
 
     def send_detailed_report(self, vps_list: List[Dict], critical_threshold: float = 90, alert_threshold: float = 80,
-                             warning_threshold: float = 60, failed: List[Tuple[str, str]] = None) -> bool:
+                             warning_threshold: float = 60, failed: List[Tuple[str, str]] = None,
+                             next_run: Tuple[Optional[datetime], str] = None) -> bool:
         """发送详细报告（分层展示 + 历史对比），🔴 级别额外发送独立告警；返回是否全部发送成功"""
         title, text = self.build_report(
             vps_list, critical_threshold, alert_threshold, warning_threshold,
-            failed=failed, last_history=load_last_history(), next_run=CronParser.get_next_run_time()
+            failed=failed, last_history=load_last_history(),
+            next_run=next_run if next_run is not None else CronParser.get_next_run_time()
         )
+        append_github_file('GITHUB_STEP_SUMMARY', f"## {title}\n\n{text}\n")
 
         critical = sorted([v for v in vps_list if v['bandwidth']['usage_percent'] >= critical_threshold],
                           key=lambda x: x['bandwidth']['usage_percent'], reverse=True)
@@ -823,7 +905,8 @@ class VPSMonitor:
         return ok
 
     def monitor_and_report(self, vps_configs: List[Dict], critical_threshold: float = 90, alert_threshold: float = 80,
-                           warning_threshold: float = 60, save: bool = True) -> bool:
+                           warning_threshold: float = 60, save: bool = True,
+                           next_run: Tuple[Optional[datetime], str] = None) -> bool:
         """监控并发送详细报告，返回本次执行是否成功"""
         results, failed = self.check_vps_list(vps_configs)
 
@@ -835,10 +918,12 @@ class VPSMonitor:
                 text += f"- **{name}**：{reason}\n"
             text += "\n> 请检查服务器网络能否访问 api.64clouds.com，以及 veid / API 密钥是否正确\n\n"
             text += f"> {datetime.now().strftime('%m-%d %H:%M')}\n"
+            append_github_file('GITHUB_STEP_SUMMARY', text)
             self.robot.send_markdown(title='❌ VPS 监控执行失败', text=text, at_all=True)
             return False
 
-        sent = self.send_detailed_report(results, critical_threshold, alert_threshold, warning_threshold, failed=failed)
+        sent = self.send_detailed_report(results, critical_threshold, alert_threshold, warning_threshold,
+                                         failed=failed, next_run=next_run)
         if save:
             save_history(results)
 
@@ -939,7 +1024,7 @@ def load_config(config_file: str = None, require_webhook: bool = True) -> Dict:
 
 def load_last_history() -> Optional[Dict]:
     """读取上次执行记录，用于趋势对比"""
-    history_file = SCRIPT_DIR / 'history.jsonl'
+    history_file = STATE_DIR / 'history.jsonl'
     if not history_file.exists():
         return None
     last_line = None
@@ -966,21 +1051,58 @@ def save_history(results: List[Dict]):
         } for r in results]
     }
     try:
-        with open(SCRIPT_DIR / 'history.jsonl', 'a', encoding='utf-8') as f:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STATE_DIR / 'history.jsonl', 'a', encoding='utf-8') as f:
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
     except Exception as e:
         logger.warning(f"历史记录写入失败: {e}")
 
 
+def load_state() -> Dict:
+    """读取 state.json（记录最近推送过的报告时段），不存在或损坏时视为第一次运行"""
+    try:
+        with open(STATE_DIR / 'state.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"state.json 读取失败，按第一次运行处理: {e}")
+        return {}
+
+
+def save_state(state: Dict):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / 'state.json', 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+        f.write('\n')
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes')
+
+
 def main():
     """主函数"""
+    global STATE_DIR
     parser = argparse.ArgumentParser(description='VPS 流量监控系统')
     parser.add_argument('--config', '-c', type=str, default=None,
                         help='配置文件路径（默认: 脚本目录下 config.json）')
     parser.add_argument('--dry-run', action='store_true',
                         help='只在终端打印消息内容，不发送钉钉、不写历史记录')
+    parser.add_argument('--state-dir', type=str, default=os.environ.get('VPS_MONITOR_STATE_DIR'),
+                        help='history.jsonl / state.json 所在目录（默认: 脚本目录；环境变量 VPS_MONITOR_STATE_DIR）')
+    parser.add_argument('--slots', type=str, default=os.environ.get('VPS_MONITOR_SLOTS'),
+                        help='报告时段，如 09:00,21:00；用于页脚「下次检查」和 --scheduled 去重（环境变量 VPS_MONITOR_SLOTS）')
+    parser.add_argument('--scheduled', action='store_true',
+                        help='按定时推送处理：当前时段已推送过或触发太晚就跳过，需配合 --slots'
+                             '（环境变量 VPS_MONITOR_SCHEDULED=true；GitHub 自带定时触发时自动开启）')
+    parser.add_argument('--max-delay', type=int, default=int(os.environ.get('VPS_MONITOR_MAX_DELAY') or 180),
+                        help='--scheduled 时，触发晚于时段多少分钟就不再推送（默认 180；环境变量 VPS_MONITOR_MAX_DELAY）')
     args = parser.parse_args()
 
+    if args.state_dir:
+        STATE_DIR = Path(args.state_dir).resolve()
     setup_logging()
 
     logger.info("=" * 50)
@@ -989,6 +1111,32 @@ def main():
 
     # 加载配置
     config = load_config(args.config)
+
+    slots = None
+    if args.slots:
+        try:
+            slots = ReportSlots(args.slots, args.max_delay)
+        except ValueError as e:
+            logger.error(f"❌ 报告时段配置错误: {e}")
+            sys.exit(1)
+
+    # 定时推送可能有多路触发（外部准点触发 + GitHub 兜底定时），同一时段只推一次
+    scheduled = args.scheduled or env_flag('VPS_MONITOR_SCHEDULED') or os.environ.get('GITHUB_EVENT_NAME') == 'schedule'
+    state, slot = None, None
+    if scheduled and not args.dry_run:
+        if not slots:
+            logger.error("❌ --scheduled 需要同时指定报告时段 --slots（或环境变量 VPS_MONITOR_SLOTS）")
+            sys.exit(1)
+        now = datetime.now()
+        state = load_state()
+        reason = slots.skip_reason(now, state)
+        if reason:
+            logger.info(f"⏭️  {reason}")
+            append_github_file('GITHUB_STEP_SUMMARY', f"## ⏭️ 跳过\n\n{reason}。本次没有发送消息，历史记录也没有改动。\n")
+            append_github_file('GITHUB_OUTPUT', "skipped=true\n")
+            sys.exit(0)
+        slot = slots.current(now)
+        logger.info(f"🕘 本次推送 {ReportSlots.key(slot)} 时段的报告")
 
     # 初始化钉钉机器人
     robot = DingTalkRobot(
@@ -1006,8 +1154,14 @@ def main():
         critical_threshold=config['monitor'].get('critical_threshold', 90),
         alert_threshold=config['monitor']['alert_threshold'],
         warning_threshold=config['monitor'].get('warning_threshold', 60),
-        save=not args.dry_run
+        save=not args.dry_run,
+        next_run=slots.next_run() if slots else None
     )
+
+    # 报告发送成功才记下这个时段；失败时留给下一路触发重试
+    if ok and slot is not None:
+        state['last_slot'] = ReportSlots.key(slot)
+        save_state(state)
 
     logger.info("=" * 50)
     logger.info("✅ 监控任务完成" if ok else "⚠️ 监控任务完成，但存在失败（详见上方日志）")
